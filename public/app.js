@@ -559,51 +559,255 @@ function setGeneratingState(isGenerating) {
    PDF Download Functionality
    ========================================================================== */
 
-function downloadPDF() {
-  const el = document.getElementById('resume-paper-target');
-  if (!el) return;
+async function downloadPDF() {
+  // Prevent simultaneous downloads
+  if (window._isGeneratingPdf) return;
 
   const data = collectFormData();
-  const userName = data.personal.name || 'Professional';
-  const cleanFilename = `${userName.replace(/[^a-zA-Z0-9_-]/g, '_')}_Resume.pdf`;
+  const hasContent = data.personal.name || data.personal.targetRole || data.personal.email || 
+                     data.personal.phone || data.rawSummary || data.experience.length || 
+                     data.projects.length || data.education.length || data.skills.length;
 
-  showToast('Preparing your high-resolution PDF...', 'info', 3000);
-
-  if (typeof html2pdf !== 'undefined') {
-    const opt = {
-      margin: [0.3, 0.35, 0.3, 0.35],
-      filename: cleanFilename,
-      image: { type: 'jpeg', quality: 0.98 },
-      html2canvas: {
-        scale: 2.2,
-        useCORS: true,
-        letterRendering: true,
-        backgroundColor: '#ffffff',
-      },
-      jsPDF: {
-        unit: 'in',
-        format: 'letter',
-        orientation: 'portrait',
-      },
-      pagebreak: { mode: ['avoid-all', 'css', 'legacy'] },
-    };
-
-    html2pdf()
-      .set(opt)
-      .from(el)
-      .save()
-      .then(() => {
-        showToast('PDF downloaded successfully!', 'success', 3500);
-      })
-      .catch((err) => {
-        console.error('PDF download error:', err);
-        showToast('Failed to export PDF with html2pdf. Opening print window...', 'error');
-        window.print();
-      });
-  } else {
-    // Native print fallback
-    window.print();
+  if (!hasContent && !currentAiResult) {
+    showToast('Please enter your resume details or click "Load Sample" before downloading.', 'error', 4000);
+    return;
   }
+
+  const sourceEl = document.getElementById('resume-paper-target');
+  if (!sourceEl) {
+    showToast('Resume preview element not found.', 'error', 4000);
+    return;
+  }
+
+  // Set loading state on all download buttons
+  window._isGeneratingPdf = true;
+  setPdfLoadingState(true);
+  showToast('Preparing your high-resolution A4 PDF...', 'info', 4000);
+
+  let pdfContainer = null;
+
+  try {
+    // 1. Ensure fonts are fully loaded
+    if (document.fonts && document.fonts.ready) {
+      await document.fonts.ready;
+    }
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // 2. Prepare filename
+    const userName = data.personal.name || 'Professional';
+    const cleanFilename = `${userName.replace(/[^a-zA-Z0-9_-]/g, '_')}_Resume.pdf`;
+
+    // 3. Create Dedicated A4 PDF Container (794px width = standard 210mm A4 at 96 DPI)
+    pdfContainer = document.createElement('div');
+    pdfContainer.id = 'a4-pdf-render-target';
+    pdfContainer.className = 'resume-paper-sheet ' + (currentTemplate || 'template-modern');
+    
+    // Apply strict A4 document styles (not inheriting responsive layout)
+    pdfContainer.style.width = '794px';
+    pdfContainer.style.minHeight = '1123px';
+    pdfContainer.style.boxSizing = 'border-box';
+    pdfContainer.style.margin = '0';
+    pdfContainer.style.padding = '44px 48px';
+    pdfContainer.style.backgroundColor = '#ffffff';
+    pdfContainer.style.color = '#1e293b';
+    pdfContainer.style.position = 'absolute';
+    pdfContainer.style.top = '0';
+    pdfContainer.style.left = '0';
+    pdfContainer.style.zIndex = '-99999';
+    pdfContainer.style.visibility = 'visible';
+    pdfContainer.style.opacity = '1';
+    pdfContainer.style.boxShadow = 'none';
+    pdfContainer.style.border = 'none';
+    pdfContainer.style.borderRadius = '0';
+    pdfContainer.style.transform = 'none';
+
+    // Copy rendered resume content
+    pdfContainer.innerHTML = sourceEl.innerHTML;
+    
+    // Remove screen highlights
+    const highlights = pdfContainer.querySelectorAll('.ai-highlight-fresh');
+    highlights.forEach(el => el.classList.remove('ai-highlight-fresh'));
+
+    document.body.appendChild(pdfContainer);
+
+    // Allow DOM to settle
+    await new Promise(resolve => setTimeout(resolve, 150));
+
+    const containerWidth = pdfContainer.offsetWidth || 794;
+    const containerHeight = pdfContainer.offsetHeight;
+
+    // Element bounds for smart multi-page slicing
+    const elements = Array.from(pdfContainer.querySelectorAll('.resume-section-title, .resume-entry, .resume-header'));
+    const parentRect = pdfContainer.getBoundingClientRect();
+    const elementBounds = elements.map(el => {
+      const rect = el.getBoundingClientRect();
+      return {
+        top: (rect.top - parentRect.top) * 2, // Scale factor = 2
+        bottom: (rect.bottom - parentRect.top) * 2,
+        isSectionHeader: el.classList.contains('resume-section-title')
+      };
+    });
+
+    // 4. Capture with html2canvas starting from x=0, y=0
+    const html2canvasFn = window.html2canvas || (typeof html2pdf !== 'undefined' && html2pdf.Worker ? null : null);
+    if (!html2canvasFn) {
+      throw new Error('html2canvas library is not available.');
+    }
+
+    const canvas = await html2canvasFn(pdfContainer, {
+      scale: 2, // High resolution (1588px width)
+      useCORS: true,
+      scrollX: 0,
+      scrollY: 0,
+      x: 0,
+      y: 0,
+      width: containerWidth,
+      windowWidth: containerWidth,
+      backgroundColor: '#ffffff',
+      logging: false,
+      allowTaint: true
+    });
+
+    // Clean up DOM container
+    if (pdfContainer && pdfContainer.parentNode) {
+      pdfContainer.parentNode.removeChild(pdfContainer);
+      pdfContainer = null;
+    }
+
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+
+    // 5. A4 Geometry & Page Break Calculations
+    const pdfWidthMm = 210;
+    const pdfHeightMm = 297;
+    const pageCanvasHeight = Math.round(canvasWidth * (pdfHeightMm / pdfWidthMm));
+    const topMarginPx = 44 * 2; // 88px top margin on subsequent pages
+
+    // Debugging diagnostics log
+    console.log('--- PDF Export Diagnostics ---');
+    console.log('PDF container width:', containerWidth + 'px');
+    console.log('PDF container height:', containerHeight + 'px');
+    console.log('canvas width:', canvasWidth + 'px');
+    console.log('canvas height:', canvasHeight + 'px');
+    console.log('calculated PDF page width:', pdfWidthMm + 'mm');
+    console.log('calculated PDF page height:', pdfHeightMm + 'mm');
+
+    // Smart slice boundaries
+    const pageSlices = [];
+    let currentY = 0;
+
+    if (canvasHeight <= pageCanvasHeight + 20) {
+      // Natural single page
+      pageSlices.push({ startY: 0, endY: canvasHeight });
+    } else {
+      // Multi-page slicing
+      while (currentY < canvasHeight) {
+        const remaining = canvasHeight - currentY;
+        if (remaining <= 40) break; // Avoid tiny empty fragment
+
+        const maxUsableHeight = pageSlices.length === 0 ? pageCanvasHeight : (pageCanvasHeight - topMarginPx);
+        let targetY = currentY + maxUsableHeight;
+
+        if (targetY >= canvasHeight) {
+          pageSlices.push({ startY: currentY, endY: canvasHeight });
+          break;
+        }
+
+        let bestCut = targetY;
+        for (const b of elementBounds) {
+          if (b.top < targetY && b.bottom > targetY) {
+            if (b.top - currentY > maxUsableHeight * 0.55) {
+              bestCut = b.top;
+            }
+            break;
+          }
+          if (b.isSectionHeader && b.top > currentY + maxUsableHeight - 140 && b.top < targetY) {
+            if (b.top - currentY > maxUsableHeight * 0.50) {
+              bestCut = b.top;
+              break;
+            }
+          }
+        }
+
+        pageSlices.push({ startY: currentY, endY: bestCut });
+        currentY = bestCut;
+      }
+    }
+
+    console.log('number of generated pages:', pageSlices.length);
+
+    // 6. Build PDF with jsPDF
+    const jsPdfClass = (window.jspdf && window.jspdf.jsPDF) || window.jsPDF;
+    if (!jsPdfClass) {
+      throw new Error('jsPDF library is not available.');
+    }
+
+    const pdf = new jsPdfClass('p', 'mm', 'a4');
+
+    pageSlices.forEach((slice, idx) => {
+      if (idx > 0) {
+        pdf.addPage('a4', 'portrait');
+      }
+
+      const sliceHeight = slice.endY - slice.startY;
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = canvasWidth;
+      pageCanvas.height = pageCanvasHeight;
+      const ctx = pageCanvas.getContext('2d');
+
+      // Pristine white background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvasWidth, pageCanvasHeight);
+
+      // Draw slice
+      const drawY = idx === 0 ? 0 : topMarginPx;
+      ctx.drawImage(canvas, 0, slice.startY, canvasWidth, sliceHeight, 0, drawY, canvasWidth, sliceHeight);
+
+      const imgData = pageCanvas.toDataURL('image/jpeg', 0.98);
+      pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidthMm, pdfHeightMm);
+    });
+
+    // 7. Save PDF
+    pdf.save(cleanFilename);
+    showToast('✅ PDF downloaded successfully!', 'success', 3500);
+
+  } catch (err) {
+    console.error('PDF export failed:', err);
+    if (pdfContainer && pdfContainer.parentNode) {
+      pdfContainer.parentNode.removeChild(pdfContainer);
+    }
+
+    showToast('PDF export error: ' + (err.message || 'Unable to generate PDF'), 'error', 5000);
+    
+    // Friendly fallback
+    setTimeout(() => {
+      window.print();
+    }, 500);
+  } finally {
+    window._isGeneratingPdf = false;
+    setPdfLoadingState(false);
+  }
+}
+
+function setPdfLoadingState(isLoading) {
+  const btns = document.querySelectorAll('.btn-download-pdf');
+  btns.forEach(btn => {
+    btn.disabled = isLoading;
+    if (isLoading) {
+      btn.innerHTML = `
+        <div class="spinner" style="width: 14px; height: 14px; border-width: 2px;"></div>
+        <span>Preparing PDF...</span>
+      `;
+    } else {
+      btn.innerHTML = `
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+        </svg>
+        <span>Download PDF</span>
+      `;
+    }
+  });
 }
 
 /* ==========================================================================
